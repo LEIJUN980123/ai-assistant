@@ -9,6 +9,25 @@ import re
 from typing import Dict, Any
 from qwen_client import call_qwen  # 复用 Day 3 的客户端
 
+
+def parse_json_response(text: str) -> Dict[str, Any]:
+    """从模型输出中提取 JSON"""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # 尝试用正则提取 {...} 部分
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group())
+            except:
+                pass
+    return {
+        "error": "模型未返回有效 JSON",
+        "raw_output": text
+    }
+
+
 def build_structured_prompt(user_question: str) -> str:
     """构建强约束的 Prompt"""
     return f"""
@@ -66,6 +85,14 @@ def parse_llm_response(raw_output: str) -> Dict[str, str]:
 
     # 失败
     raise ValueError(f"无法解析为 JSON: {raw_output[:100]}...")
+def call_structured_qa(question: str, provider: str = "qwen", model: str = None) -> Dict[str, Any]:
+    from qwen_client import call_qwen
+    
+    prompt = build_structured_prompt(question)
+    raw_response = call_qwen(prompt=prompt, model=model or "qwen-max")
+    
+    return parse_json_response(raw_response)
+
 
 def call_structured_qa(
     question: str,
