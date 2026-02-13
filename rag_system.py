@@ -3,6 +3,7 @@ import os
 import json
 import logging
 import torch
+import re
 from pathlib import Path
 from typing import List, Dict, Any
 import numpy as np
@@ -16,19 +17,18 @@ from qwen_client import call_qwen
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 class RAGSystem:
-    def __init__(self, document_path: str, chunk_size: int = 500, chunk_overlap: int = 50):
+    def __init__(self, document_path: str, chunk_size: int = 500):
         """
-        初始化 RAG 系统
+        初始化 RAG 系统（使用语义感知文本分块）
         
         Args:
             document_path (str): JSON 文档路径（来自 pdf_to_json.py）
-            chunk_size (int): 每个文本块的最大字符数
-            chunk_overlap (int): 块之间重叠字符数
+            chunk_size (int): 每个文本块的目标最大字符数（默认 500）
         """
         self.document_path = Path(document_path)
         self.chunk_size = chunk_size
-        self.chunk_overlap = chunk_overlap
         self.chunks = []          # List[str]
         self.chunk_metadatas = [] # List[Dict]
         self.index = None         # FAISS index
@@ -60,70 +60,108 @@ class RAGSystem:
         self.raw_texts = texts
         self.sources = sources
         logger.info(f"✅ 加载 {len(texts)} 段原始文本")
-    
+
+    def _split_into_sentences(self, text: str) -> List[str]:
+        """按中英文句末标点切分句子"""
+        sentence_endings = r'[。！？\.!?]'
+        parts = re.split(f'({sentence_endings})', text)
+        sentences = []
+        i = 0
+        while i < len(parts):
+            if i + 1 < len(parts) and re.match(sentence_endings, parts[i + 1]):
+                sentences.append(parts[i] + parts[i + 1])
+                i += 2
+            else:
+                if parts[i].strip():
+                    sentences.append(parts[i])
+                i += 1
+        return [s.strip() for s in sentences if s.strip()]
+
     def _chunk_documents(self):
-        """将长文本切分为小块"""
+        """将长文本按语义边界（段落/句子）切分为小块"""
         self.chunks = []
         self.chunk_metadatas = []
+
         for i, text in enumerate(self.raw_texts):
             if not text.strip():
                 continue
-            text_len=len(text)
-            start = 0
-            while start < text_len:
-                end = start + self.chunk_size
-                
-                chunk = text[start:end]
-                if chunk.strip():
-                    self.chunks.append(chunk)
-                    self.chunk_metadatas.append({
-                        "source": self.sources[i],
-                        "chunk_id": len(self.chunks) - 1,
-                        "start_char": start,
-                        "end_char": min(end, text_len)
-                    })
-                
-                if end >= text_len:
-                    break  # 到达末尾，退出
-        
-                # 计算下一块的起始位置
-                start = end - self.chunk_overlap
-        
-                # 安全检查：防止不前进
-                if start >= end:
-                    start = end
-                
-        logger.info(f"✅ 切分为 {len(self.chunks)} 个文本块")
-    
+
+            source = self.sources[i]
+            current_chunk = ""
+            
+            # 按自然段落分割（双换行符）
+            paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+            
+            for para in paragraphs:
+                if len(para) <= self.chunk_size:
+                    # 短段落：尝试合并到当前块
+                    if current_chunk and len(current_chunk) + len(para) + 2 <= self.chunk_size:
+                        current_chunk += "\n\n" + para
+                    else:
+                        # 保存当前块
+                        if current_chunk:
+                            self.chunks.append(current_chunk)
+                            self.chunk_metadatas.append({
+                                "source": source,
+                                "chunk_id": len(self.chunks) - 1,
+                                "start_char": -1,
+                                "end_char": -1
+                            })
+                        current_chunk = para
+                else:
+                    # 长段落：按句子切分
+                    sentences = self._split_into_sentences(para)
+                    for sent in sentences:
+                        if current_chunk and len(current_chunk) + len(sent) + 1 <= self.chunk_size:
+                            current_chunk += " " + sent
+                        else:
+                            if current_chunk:
+                                self.chunks.append(current_chunk)
+                                self.chunk_metadatas.append({
+                                    "source": source,
+                                    "chunk_id": len(self.chunks) - 1,
+                                    "start_char": -1,
+                                    "end_char": -1
+                                })
+                            current_chunk = sent
+            
+            # 添加最后一块
+            if current_chunk:
+                self.chunks.append(current_chunk)
+                self.chunk_metadatas.append({
+                    "source": source,
+                    "chunk_id": len(self.chunks) - 1,
+                    "start_char": -1,
+                    "end_char": -1
+                })
+
+        logger.info(f"✅ 切分为 {len(self.chunks)} 个语义文本块")
+
     def _build_vector_index(self):
         """构建 FAISS 向量索引（带缓存和安全检查）"""
-    
-        # === 1. 懒加载嵌入模型 ===
         if self.embedding_model is None:
             logger.info("正在加载嵌入模型...")
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
             self.embedding_model = SentenceTransformer(
                 'paraphrase-multilingual-MiniLM-L12-v2',
-                device='cuda' if torch.cuda.is_available() else 'cpu'
+                device=device
             )
-            logger.info("✅ 嵌入模型加载完成")
+            logger.info(f"✅ 嵌入模型加载完成（设备: {device}）")
         else:
             logger.info("复用已加载的嵌入模型")
 
-        # === 2. 安全检查：是否有文本块 ===
         if not self.chunks:
             logger.warning("⚠️ 无可用于构建索引的文本块，跳过索引构建")
             self.index = None
             return
 
-        # === 3. 生成向量 ===
         logger.info(f"正在为 {len(self.chunks)} 个文本块生成向量...")
         embeddings = self.embedding_model.encode(
             self.chunks,
             show_progress_bar=True,
-            convert_to_numpy=True  # 显式指定返回 numpy array
+            convert_to_numpy=True
         ).astype('float32')
 
-        # === 4. 构建 FAISS 索引 ===
         dimension = embeddings.shape[1]
         self.index = faiss.IndexFlatL2(dimension)
         self.index.add(embeddings)
@@ -135,14 +173,10 @@ class RAGSystem:
         if self.index is None:
             raise RuntimeError("向量索引未初始化")
         
-        # 生成查询向量
         query_vector = self.embedding_model.encode([query])
         query_vector = np.array(query_vector).astype('float32')
-        
-        # 检索
         distances, indices = self.index.search(query_vector, k)
         
-        # 构建结果
         results = []
         for i, idx in enumerate(indices[0]):
             if idx < len(self.chunks):
@@ -151,31 +185,50 @@ class RAGSystem:
                     "metadata": self.chunk_metadatas[idx],
                     "score": float(distances[0][i])
                 })
-        
         return results
     
-    def generate_answer(self, question: str, context_list: List[str]) -> str:
-        """使用 Qwen 生成答案"""
-        # 拼接上下文（限制长度）
-        context = "\n\n".join(context_list[:2])  # 只用前2个最相关
+    def generate_answer(self, question: str, context_list: List[str], max_contexts: int = 3) -> str:
+        """使用 Qwen 生成答案（基于检索到的上下文）"""
+        if not context_list:
+            return "根据现有资料无法确定"
+
+        selected_contexts = []
+        total_len = 0
+        max_chars = 2000  # 保守限制，避免超出模型上下文
+
+        for ctx in context_list[:max_contexts]:
+            if total_len + len(ctx) > max_chars:
+                break
+            selected_contexts.append(ctx)
+            total_len += len(ctx)
+
+        context = "\n\n".join(selected_contexts)
         
-        prompt = f"""你是一个专业助手，请基于以下上下文回答问题。
-如果上下文不包含答案，请回答“根据现有资料无法确定”。
+        prompt = f"""你是一个严谨的 AI 助手，请严格根据以下【上下文】回答问题。
+- 如果上下文包含足够信息，请直接给出**简洁、准确**的答案。
+- 如果上下文不包含相关信息，请回答：“根据现有资料无法确定”。
+- 不要编造信息，不要解释推理过程，不要添加额外说明。
 
 上下文：
 {context}
 
-问题：{question}
+问题：
+{question}
 
-请直接给出简洁答案，不要解释过程。"""
-        
-        return call_qwen(prompt, model="qwen-max")
+【回答】
+"""
+
+        try:
+            response = call_qwen(prompt, model="qwen-max")
+            return response.strip()
+        except Exception as e:
+            logger.error(f"Qwen 调用失败: {e}")
+            return "抱歉，生成答案时出现错误，请稍后重试。"
     
     def ask(self, question: str, top_k: int = 3) -> Dict[str, Any]:
         """端到端问答"""
         logger.info(f"🔍 检索中: '{question}'")
         retrieved = self.retrieve(question, k=top_k)
-        
         contexts = [item["content"] for item in retrieved]
         answer = self.generate_answer(question, contexts)
         
@@ -190,13 +243,10 @@ class RAGSystem:
 # 使用示例
 # ======================
 if __name__ == "__main__":
-    # 配置路径（根据你的实际路径修改）
     DOC_PATH = "data/processed/Docker.json"
     
-    # 初始化 RAG 系统
-    rag = RAGSystem(DOC_PATH)
+    rag = RAGSystem(DOC_PATH, chunk_size=500)
     
-    # 测试问题
     questions = [
         "Docker镜像如何构建？",
         "容器和镜像的区别是什么？",
@@ -209,7 +259,6 @@ if __name__ == "__main__":
         print(f"❓ 问题: {result['question']}")
         print(f"✅ 答案: {result['answer']}")
         
-        # 打印来源（调试用）
         print("\n📚 检索到的片段:")
         for i, chunk in enumerate(result["retrieved_chunks"][:2]):
             source = chunk["metadata"]["source"]
