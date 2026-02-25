@@ -45,7 +45,12 @@ def call_qwen(
     """
     if not client.api_key:
         return "❌ 错误：未配置 DASHSCOPE_API_KEY，请检查 .env 文件"
+    if not isinstance(prompt, str):
+        logger.error(f"❌ prompt 类型错误：期望 str，实际为 {type(prompt)}，值: {repr(prompt)[:100]}")
+        return "❌ 内部错误：prompt 必须是字符串"
 
+    if not client.api_key:
+        return "❌ 错误：未配置 DASHSCOPE_API_KEY，请检查 .env 文件"
     for attempt in range(max_retries + 1):
         try:
             logger.info(f"🚀 调用 Qwen (尝试 {attempt + 1}/{max_retries + 1})")
