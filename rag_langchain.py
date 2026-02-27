@@ -17,9 +17,6 @@ from langchain_chroma import Chroma
 from embedding_client import get_embeddings
 from qwen_client import call_qwen
 
-# DuckDuckGo 搜索
-from duckduckgo_search import DDGS
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -62,27 +59,7 @@ class CustomQwenLLM:
 
 
 # ==============================
-# 3. 可信搜索函数（DuckDuckGo）
-# ==============================
-def trusted_search(query: str, num_results: int = 3) -> str:
-    """使用 DuckDuckGo 免费搜索获取摘要"""
-    try:
-        with DDGS() as ddgs:
-            results = ddgs.text(
-                keywords=query,
-                region="zh-cn",
-                safesearch="moderate",
-                max_results=num_results
-            )
-            snippets = [r["body"] for r in results if r.get("body")]
-            return "\n".join(snippets[:num_results])
-    except Exception as e:
-        logger.warning(f"🔍 DuckDuckGo 搜索失败: {e}")
-        return ""
-
-
-# ==============================
-# 4. 主 RAG 类
+# 3. 主 RAG 类
 # ==============================
 class LangChainRAG:
     def __init__(
@@ -129,22 +106,35 @@ class LangChainRAG:
             data = json.load(f)
 
         docs = []
-        if "pages" in data:
-            for page in data["pages"]:
-                content = page["content"]
-                source = f"{data['metadata']['source_file']}:p{page['page_number']}"
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                content = item.get("content", "").strip()
+                if not content:
+                    continue
+                source = item.get("filename", "unknown")
+                docs.append(Document(page_content=content, metadata={"source": source}))
+        elif isinstance(data, dict):
+            # 单个文件的情况
+            content = data.get("content", "").strip()
+            if content:
+                source = data.get("filename", "unknown")
                 docs.append(Document(page_content=content, metadata={"source": source}))
         else:
-            texts = data if isinstance(data, list) else [data.get("text", "")]
-            for text in texts:
-                docs.append(Document(page_content=text, metadata={"source": "unknown"}))
+            logger.error(f"不支持的数据类型: {type(data)}")
+
+        if not docs:
+            logger.warning(f"⚠️ 未从 {self.document_path} 加载任何有效文档！")
+
         return docs
+
 
     def _build_rag_chain(self):
         prompt_template = """你是一个严谨的 AI 助手，请严格根据以下【上下文】回答问题。
-- 如果上下文包含足够信息，请直接给出**简洁、准确**的答案。
-- 如果上下文不包含相关信息，请回答：“根据现有资料无法确定”。
-- 不要编造信息，不要解释推理过程，不要添加额外说明。
+                            - 如果上下文包含足够信息，请直接给出**简洁、准确**的答案。
+                            - 如果上下文不包含相关信息，请回答：“根据现有资料无法确定”。
+                            - 不要编造信息，不要解释推理过程，不要添加额外说明。
 
 上下文：
 {context}
@@ -180,7 +170,7 @@ class LangChainRAG:
 
 
 # ==============================
-# 5. 带记忆 + 搜索兜底的 RAG
+# 4. 带记忆 + Qwen 兜底的 RAG（无网络搜索）
 # ==============================
 class LangChainRAGWithMemory(LangChainRAG):
     def ask(self, question: str, session_id: Optional[str] = None) -> str:
@@ -206,32 +196,23 @@ class LangChainRAGWithMemory(LangChainRAG):
         # Step 2: 先走本地 RAG
         answer = super().ask(actual_question)
 
-        # Step 3: 如果无答案，触发搜索
+        # Step 3: 如果无答案，改用纯 Qwen 回答（兜底）
         if "根据现有资料无法确定" in answer:
-            logger.info("🔍 本地无答案，触发 DuckDuckGo 搜索...")
-            search_results = trusted_search(question)  # 用原始 question 搜索
-            if search_results.strip():
-                fallback_prompt = f"""你是一个严谨的 AI 助手，请基于以下【网络搜索结果】回答问题。
-- 只使用搜索结果中的信息，不要编造。
-- 如果结果不相关或为空，请回答“未找到相关信息”。
+            logger.info("🧠 本地无答案，启用 Qwen 通用知识回答...")
+            fallback_prompt = f"""你是一个知识渊博的 AI 助手，请基于你的通用知识回答以下问题。
+                                - 回答应简洁、准确、有帮助。
+                                - 如果你不确定，请说“我不清楚”。
 
-【搜索结果】
-{search_results}
-
-【问题】
+问题：
 {question}
 
-【回答】
+回答：
 """
-                llm = CustomQwenLLM()
-                answer = llm.invoke(fallback_prompt)
-            else:
-                answer = "未找到相关信息"
+            llm = CustomQwenLLM()
+            answer = llm.invoke(fallback_prompt)
 
         # Step 4: 保存到会话历史（仅当 session_id 提供时）
         if session_id is not None:
             SESSION_HISTORY[session_id].append((question, answer))
 
         return answer
-
-

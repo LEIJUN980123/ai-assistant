@@ -3,7 +3,7 @@ from qwen_client import call_qwen
 
 def test_normal():
     print("【正常调用】")
-    ans = call_qwen("你好，请用一句话介绍你自己。")
+    ans = call_qwen("2025年奥运会的举办地")
     print("回答:", ans)
     print("-" * 50)
 
@@ -22,5 +22,5 @@ def test_invalid_key():
     print("-" * 50)
 
 if __name__ == "__main__":
-    #test_normal()
-     test_invalid_key()  # 取消注释可测试错误处理
+    test_normal()
+    #test_invalid_key()  # 取消注释可测试错误处理

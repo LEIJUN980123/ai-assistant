@@ -147,9 +147,9 @@ class RAGSystem:
 
         context = "\n\n".join(selected)
         prompt =  f"""你是一个严谨的 AI 助手，请严格根据以下【上下文】回答问题。
-- 如果上下文包含足够信息，请直接给出**简洁、准确**的答案。
-- 如果上下文不包含相关信息，请回答：“根据现有资料无法确定”。
-- 不要编造信息，不要解释推理过程，不要添加额外说明。
+                    - 如果上下文包含足够信息，请直接给出**简洁、准确**的答案。
+                    - 如果上下文不包含相关信息，请回答：“根据现有资料无法确定”。
+                    - 不要编造信息，不要解释推理过程，不要添加额外说明。
 
 上下文：
 {context}
@@ -172,25 +172,3 @@ class RAGSystem:
         answer = self.generate_answer(question, contexts)
         return {"question": question, "answer": answer, "retrieved_chunks": retrieved}
 
-
-# ======================
-# 使用示例
-# ======================
-if __name__ == "__main__":
-    import os
-    # 切换模式：开发（MiniLM） / 上线（Qwen）
-    os.environ["USE_QWEN_EMBEDDING"] = "true"  # ← 改这里！
-
-    rag = RAGSystem("data/processed/Docker.json")
-
-        # 测试问题
-    questions = [
-        "Docker镜像如何构建？",
-        "容器和镜像的区别是什么？",
-        "如何查看运行中的容器？"
-    ]
-    for q in questions:
-        
-        result = rag.ask(q)
-        print("❓", result["question"])
-        print("✅", result["answer"])
